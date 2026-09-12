@@ -9,7 +9,7 @@ targets:
   dev:
     workspace:
       # Enter your Databricks Workspace base deployment URL here
-      host: https://azuredatabricks.net
+      host: https://dbc-a1d25508-ad4e.cloud.databricks.com
       mode: development
 
 resources:
@@ -20,7 +20,7 @@ resources:
     rearc_medallion_pipeline:
       name: rearc_medallion_dlt_pipeline
       target: default # Target Schema destination namespace
-      catalog: main   # Target Catalog destination namespace
+      catalog: rearc  # Target Catalog destination namespace
       edition: advanced # Advanced is mandatory to enable DLT Data Quality Expectations
       libraries:
         - notebook:
