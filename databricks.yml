@@ -10,7 +10,7 @@ targets:
     workspace:
       # Enter your Databricks Workspace base deployment URL here
       host: https://dbc-a1d25508-ad4e.cloud.databricks.com
-      mode: development
+    development: true
 
 resources:
   pipelines:
@@ -34,11 +34,11 @@ resources:
     rearc_orchestration_job:
       name: rearc_master_orchestration_job
       tasks:
-        # Task 1: Execute Python Ingestion to fetch BLS and Population Data
+        # Task 1: Execute Pure Python Ingestion Script to fetch BLS and Population Data
         - task_key: step1_ingestion_task
           job_cluster_key: shared_job_cluster
-          notebook_task:
-            notebook_path: ./src/step1_ingestion.py
+          spark_python_task:
+            python_file: ./src/step1_ingestion.py
             
         # Task 2: Trigger Delta Live Tables processing after Ingestion finishes
         - task_key: step2_dlt_pipeline_task
@@ -50,8 +50,11 @@ resources:
       job_clusters:
         - job_cluster_key: shared_job_cluster
           new_cluster:
-            spark_version: 14.3.x-scala2.12 # Standard enterprise runtime
-            node_type_id: Standard_D4s_v5    # Lean single-node configuration for cost control
-            num_workers: 0                   # 0 workers specifies Single Node mode
+            spark_version: 14.3.x-scala2.12 
+            node_type_id: Standard_D4s_v5    
+            num_workers: 0                   
             spark_conf:
               spark.databricks.cluster.profile: singleNode
+              spark.master: local[*]  # CRITICAL FIX: Directs Spark to run completely in local single node memory
+            custom_tags:
+              ResourceClass: SingleNode # CRITICAL FIX: Satisfies cloud cost single node tags validation
