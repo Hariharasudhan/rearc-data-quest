@@ -1,0 +1,12 @@
+# Ignore local Databricks environment token directories and bundle build logs
+.databricks/
+.bundle/
+target/
+
+# Ignore Python runtime compile caches
+__pycache__/
+*.pyc
+
+# Ignore local system operating system decoration caches
+.DS_Store
+Thumbs.db

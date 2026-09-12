@@ -1,0 +1,57 @@
+# ==============================================================================
+# DATABRICKS ASSET BUNDLE DEFINITION FOR REARC DATA QUEST
+# ==============================================================================
+bundle:
+  name: rearc-data-quest
+
+# Define targets for cross-environment deployments (Dev / Prod execution models)
+targets:
+  dev:
+    workspace:
+      # Enter your Databricks Workspace base deployment URL here
+      host: https://azuredatabricks.net
+      mode: development
+
+resources:
+  pipelines:
+    # --------------------------------------------------------------------------
+    # 1. Delta Live Tables / Lakeflow Pipeline Configuration
+    # --------------------------------------------------------------------------
+    rearc_medallion_pipeline:
+      name: rearc_medallion_dlt_pipeline
+      target: default # Target Schema destination namespace
+      catalog: main   # Target Catalog destination namespace
+      edition: advanced # Advanced is mandatory to enable DLT Data Quality Expectations
+      libraries:
+        - notebook:
+            path: ./src/step2_dlt_pipeline.py
+      development: true
+
+  jobs:
+    # --------------------------------------------------------------------------
+    # 2. Master Orchestration Workflow Job
+    # --------------------------------------------------------------------------
+    rearc_orchestration_job:
+      name: rearc_master_orchestration_job
+      tasks:
+        # Task 1: Execute Python Ingestion to fetch BLS and Population Data
+        - task_key: step1_ingestion_task
+          job_cluster_key: shared_job_cluster
+          notebook_task:
+            notebook_path: ./src/step1_ingestion.py
+            
+        # Task 2: Trigger Delta Live Tables processing after Ingestion finishes
+        - task_key: step2_dlt_pipeline_task
+          depends_on:
+            - task_key: step1_ingestion_task
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.rearc_medallion_pipeline.id}
+
+      job_clusters:
+        - job_cluster_key: shared_job_cluster
+          new_cluster:
+            spark_version: 14.3.x-scala2.12 # Standard enterprise runtime
+            node_type_id: Standard_D4s_v5    # Lean single-node configuration for cost control
+            num_workers: 0                   # 0 workers specifies Single Node mode
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
