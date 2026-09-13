@@ -230,7 +230,7 @@ def gold_top_productivity_years_sql():
                    ROW_NUMBER() OVER (PARTITION BY series_id ORDER BY total_annual_value DESC) as rank
             FROM annual_sums
         )
-        SELECT r.series_id, s.series_title, r.year, r.total_annual_value
+        SELECT r.series_id, r.year, r.total_annual_value
         FROM ranked_years r
         INNER JOIN live.silver_bls_series s ON r.series_id = s.series_id
         WHERE r.rank = 1
