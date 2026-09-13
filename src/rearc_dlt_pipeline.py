@@ -186,6 +186,74 @@ def gold_productivity_quarterly_trends():
             .otherwise(F.lit(0))
         )
     )
-
+    
 # COMMAND ----------
+
+# ==============================================================================
+# 4. REQUIRED ALTERNATIVE IMPLEMENTATIONS (SPARK SQL TIER)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Question 1 Alternative: Spark SQL Implementation
+# ------------------------------------------------------------------------------
+@dlt.table(
+    name="gold_us_population_stats_sql",
+    comment="ALTERNATIVE SPARK SQL: Mean and Standard Deviation of US Population (2013-2018)."
+)
+def gold_us_population_stats_sql():
+    # Executes declarative SQL strings against the live Silver layer view names
+    return spark.sql("""
+        SELECT 
+            AVG(population) AS mean_population,
+            STDDEV(population) AS stddev_population
+        FROM live.silver_population
+        WHERE year BETWEEN 2013 AND 2018
+    """)
+
+
+# ------------------------------------------------------------------------------
+# Question 2 Alternative: Spark SQL Implementation
+# ------------------------------------------------------------------------------
+@dlt.table(
+    name="gold_top_productivity_years_sql",
+    comment="ALTERNATIVE SPARK SQL: Highest performing productivity years per unique series_id."
+)
+def gold_top_productivity_years_sql():
+    return spark.sql("""
+        WITH annual_sums AS (
+            SELECT series_id, year, SUM(value) AS total_annual_value
+            FROM live.silver_bls_data
+            GROUP BY series_id, year
+        ),
+        ranked_years AS (
+            SELECT series_id, year, total_annual_value,
+                   ROW_NUMBER() OVER (PARTITION BY series_id ORDER BY total_annual_value DESC) as rank
+            FROM annual_sums
+        )
+        SELECT r.series_id, s.series_title, r.year, r.total_annual_value
+        FROM ranked_years r
+        INNER JOIN live.silver_bls_series s ON r.series_id = s.series_id
+        WHERE r.rank = 1
+    """)
+
+
+# ------------------------------------------------------------------------------
+# Question 3 Alternative: Spark SQL Implementation
+# ------------------------------------------------------------------------------
+@dlt.table(
+    name="gold_productivity_vs_population_master_sql",
+    comment="ALTERNATIVE SPARK SQL: Master dataset combining all BLS Series metrics with historical US Population data."
+)
+def gold_productivity_vs_population_master_sql():
+    return spark.sql("""
+        SELECT 
+            b.year,
+            b.series_id,
+            b.period,
+            b.value AS productivity_value,
+            p.population
+        FROM live.silver_bls_data b
+        LEFT JOIN live.silver_population p ON b.year = p.year
+    """)
+
 
