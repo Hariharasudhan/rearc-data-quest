@@ -6,7 +6,7 @@
 
 ---
 
-## 🏛️ 1. Architectural Philosophy & Medallion Design
+## 🏛️ 1. Architecture & Design Rationale
 
 This pipeline implements a production-grade **Medallion Architecture** managed via **Spark Declarative Pipelines (Delta Live Tables / Lakeflow)** within the Databricks Unity Catalog environment. The primary design goal is the **Separation of Concerns**: isolating untrusted network ingestion from parallelised transformations, thereby protecting the integrity of downstream data assets.
 
@@ -24,7 +24,7 @@ graph TD
     end
 
     %% Bronze Layer
-    subgraph Bronze Layer [Bronze Staging — Inferred Schema]
+    subgraph Bronze Layer [7 Bronze Tables — Schema Enforcement]
         B1[bronze_bls_data]
         B2[bronze_bls_series]
         B3[bronze_bls_sector]
@@ -33,7 +33,7 @@ graph TD
     end
 
     %% Silver Layer
-    subgraph Silver Layer [Silver Conformed — Cleansed & Typed]
+    subgraph Silver Layer [6 Silver Tables — Cleansed & Typed]
         S1[silver_bls_data]
         S2[silver_bls_series]
         S3[silver_bls_sector]
@@ -43,12 +43,18 @@ graph TD
     end
 
     %% Gold Layer
-    subgraph Gold Layer [Gold Presentation — Metric Ready]
-        G1[gold_us_population_stats]
-        G2[gold_top_productivity_years]
-        G3[gold_productivity_vs_population_master]
-        G4[gold_productivity_trends]
-        G5[gold_sector_summary]
+    subgraph Gold Layer [8 Gold Tables — Parallel Presentation Tier]
+        direction LR
+        subgraph PySpark DataFrame Engine Primary
+            G1[gold_us_population_stats]
+            G2[gold_top_productivity_years]
+            G3[gold_productivity_vs_population_master]
+        end
+        subgraph Spark SQL Engine Alternative
+            G1_S[gold_us_population_stats_sql]
+            G2_S[gold_top_productivity_years_sql]
+            G3_S[gold_productivity_vs_population_master_sql]
+        end
     end
 
     %% Flow links
@@ -60,62 +66,64 @@ graph TD
     B4 -->|Header Trim & Clean| S4
     B5 -->|Array Explode & Cast| S5
     S2 & S3 & S4 -->|Star Schema Pre-Join| M1
-    S5 -->|Filter 2013-2018| G1
-    S1 -->|Window Row Rank| G2
-    M1 -->|Inner Join Context| G2
-    S1 -->|Global Join Mapping| G3
-    S5 -->|Chronological Left Join| G3
-    S1 -->|Window Lag Metric| G4
-    S1 & M1 -->|Grouped Multi-Agg| G5
+    
+    %% PySpark Links
+    S5 --> G1
+    S1 & M1 --> G2
+    S1 & S5 --> G3
+    
+    %% SQL Links
+    S5 --> G1_S
+    S1 & M1 --> G2_S
+    S1 & S5 --> G3_S
 ```
 
----
+### Layer Strategy & Modeling Choices
+*   **The Landing Zone (Volume):** Raw text and JSON files are dropped unmodified directly into a Unity Catalog Volume. This acts as our landing storage layer. It guarantees a historical audit trail: if downstream Spark clusters or business logic break, we can re-verify the raw inputs without hitting the remote external HTTP servers again.
+*   **Bronze Layer:** Standardizes the raw directory files into tables using light structural schemas. To handle inconsistent column padding standard inside raw government metadata fields (e.g., `'series_id        '`), the Bronze layer executes a programmatic string-cleaning loop that runs `.strip()` across all headers dynamically during ingestion.
+*   **Silver Layer:** Cleans, formats, and casts data cells to double-precision `Double`, `Int`, and `Long` formats. Most importantly, it isolates the core fact dataset (`silver_bls_data`) from supporting lookup dimensions, while pre-materializing a consolidated **Wide Star Schema Lookup** (`silver_enriched_bls_metadata`). Pre-joining low-cardinality metadata datasets at this tier eliminates the need for expensive multi-stage distributed shuffles later.
+*   **Gold Layer:** Curates data products tailored directly to business metrics. Instead of hardcoding business logic (`WHERE series_id = 'PRS30006032'`), it materializes a generic, scalable left-joined master database layout. This satisfies the challenge conditions while allowing downstream users to slice any industry slice interactively without code changes.
 
-## 🚀 2. Step-by-Step Implementation Flow
+### Core Dual Fluency: PySpark vs. Spark SQL
+To establish complete technical fluency, the solution materializes the analytical assets side-by-side inside the declarative framework using both engines:
+*   **Why PySpark was Chosen as Primary:** For the core production tables (`gold_us_population_stats`, etc.), the **PySpark DataFrame API** was deployed. In an enterprise environment, PySpark is preferred for orchestration because it provides clean object-oriented unit testing, parameterization, and programmatic loops.
+*   **Why Spark SQL was Deployed as the Alternative:** The matching `*_sql` endpoints run native ANSI SQL structures (utilizing Common Table Expressions and distributed Window queries). This shows equal proficiency in writing performant declarative SQL queries directly against big data clusters.
 
-### Step 1: Ingestion & Sync Utility (`src/step1_ingestion.py`)
-*   **Bypassing the HTTP 403 Firewall:** To comply with the official **BLS Data Access Policy**, the extraction loop injects custom HTTP browser signatures integrated with user contact variables (`CUSTOM_HEADERS`). This prevents automated network firewalls from dropping the ingestion connections.
-*   **Dynamic Scraping & Zero Hardcoding:** Implemented DOM tree crawling via `BeautifulSoup4` to scan the remote web registry directory page. File paths are resolved dynamically at runtime; if new files or structural indices appear tomorrow, the script naturally ingests them without manual script modifications.
-*   **File-Level Idempotency Guard:** To adhere to the constraint of avoiding redundant processing, the utility fires light HTTP `HEAD` metadata requests before downloading data bodies. If the local file size inside our Databricks Unity Catalog **Volume** (`/Volumes/main/default/rearc_landing_zone/`) perfectly matches the server's `Content-Length`, the payload transfer is skipped entirely.
-
-### Step 2: The Staging & Cleaning Engine (`src/step2_dlt_pipeline.py`)
-*   **Bronze Ingestion (Defending Against Header Space Bugs):** The raw BLS text files contain erratic whitespace padding inside column headers (e.g., `'series_id        '`). To prevent downstream lookup failures, the Bronze schema generation runs a dynamic loop passing `.strip()` over every inferred column header name on the fly.
-*   **Delta Column Mapping Integration:** The DataUSA population JSON response embeds space characters inside nested dictionary keys (e.g., `Nation ID`). To safeguard the storage layers, enabled Delta Column Mapping via `delta.columnMapping.mode = name` right at the Bronze ingestion boundary.
-*   **Silver Cleansing & Data Quality Governance:** Applied strict programmatic checkpoints (`@dlt.expect_or_drop`) to purge corrupted or null values right at the threshold (`series_id IS NOT NULL`, `population > 0`). Text cells are trimmed using `F.trim()` and explicitly cast to proper target formats (`Double`, `Int`, `Long`).
-*   **Wide Dimensional Enrichment (`silver_enriched_bls_metadata`):** To eliminate expensive multi-stage distributed joins downstream, the normalized lookup tables (`series`, `sector`, `measure`) are pre-joined into a single wide dimension at the Silver layer. This allows the cluster to fetch descriptive context using only one single join later, avoiding cluster network degradation.
-
-### Step 3: Analytical Presentation Models (The Gold Tables)
-The Gold tier uses the **PySpark DataFrame API** as the primary software engine due to its superior testing parameterisation and modular compilation, while equivalent functional blocks are cleanly documented in **Spark SQL** to establish dual-language fluency:
-1.  **`gold_us_population_stats`:** Computes the exact `mean` and `stddev` of the US population strictly across the **2013-2018 inclusive** temporal window.
-2.  **`gold_top_productivity_years`:** Utilises a distributed Spark window function (`Window.partitionBy("series_id").orderBy(total_value.desc())`) to isolate the single peak performance year for every sector of the economy, joined against our wide metadata dimension to provide immediate context descriptions.
-3.  **`gold_productivity_vs_population_master`:** Rather than baking narrow business filters directly into the ETL layer, this was engineered as an **Unbounded Master Table** mapping all series codes and quarters side-by-side with demographics. Missing intervals gracefully resolve to `null` via a chronological `LEFT JOIN`.
-4.  **`gold_productivity_quarterly_trends` & `gold_sector_benchmarking_summary` [BONUS]:** Extended the project scope by adding quarterly growth rate tables using historical lag analytics (`F.lag()`) and macro industry floor/ceiling metrics to showcase a comprehensive BI reporting infrastructure.
+### Safe Ingestion Re-Runs (Incremental Syncing)
+The `src/step1_ingestion.py` engine guarantees strict idempotency at the network boundary. Before downloading any payload body, the crawler sends a lightweight HTTP `HEAD` request to query the server's `Content-Length` metadata. If a local file already exists in the Volume and its byte size matches perfectly, the network transfer is skipped entirely. If a file is updated on the remote server, the size mismatch triggers a safe atomic overwrite, making the ingestion fully resilient across repeated runs.
 
 ---
 
-## ⚖️ 3. Engineering Decisions & Production Trade-offs
+## ⚖️ 2. Production Trade-offs (Real-World Client Architecture)
 
-### Ingestion-Level vs. Table-Level Idempotency
-*   *Alternative Considered:* Downloading files completely into memory on every task iteration and performing row-by-row key comparisons via database lookups.
-*   *Decision:* Rejected due to severe compute and cloud costs. Streaming millions of text data rows continuously over a network to evaluate keys is an anti-pattern. Instead, implemented file-level checks at the raw ingestion layer, leaving row-level deduplication to the Delta storage layer downstream where optimized file transactions manage state transitions efficiently.
+If executing this project for a live enterprise client with massive scaling metrics, I would modify the architecture to address the following production constraints:
 
-### Reusable Master Tables vs. Narrow Fixed Reporting Views
-*   *Alternative Considered:* Hardcoding the Question 3 requirements (`WHERE series_id = 'PRS30006032' AND period = 'Q01'`) directly inside the Gold pipeline build code.
-*   *Decision:* Engineered a generic master connection model instead. Hardcoding filtering layers reduces data reusability. By materializing an open, optimized master dataset, the structure easily yields the answers to the prompt while remaining immediately ready to support unexpected future business queries via downstream SQL filters.
+### A. Schema Drift Management
+*   *Current Quest Approach:* Programmatically loops and strips whitespace from hardcoded source targets.
+*   *Enterprise Approach:* Public open APIs frequently change key names or add elements without warning. I would configure **Delta Schema Evolution** and deploy a strict schema validation gate using **DLT Schema Enforcement**. Any unrecognized structural drift parameters would automatically route raw anomalies into a quarantined "Dead Letter Queue" (DLQ) table for developer review without stopping the active streaming cluster job.
+
+### B. High Data Volume Processing
+*   *Current Quest Approach:* Streams the entire `pr.data.0.Current` file via single-node compute.
+*   *Enterprise Approach:* As data volumes scale into billions of entries, processing the complete historical ledger every run becomes bottlenecked. I would pivot the Bronze-to-Silver framework into a true **Streaming Live Table Engine** using Databricks **Auto Loader (`cloudFiles`)**. It tracks file system state updates natively, performing incremental delta appends rather than expensive table overwrites.
+
+### C. Cost Optimization
+*   *Current Quest Approach:* Executes standard DLT tasks on a triggered single-node architecture.
+*   *Enterprise Approach:* For a real client, running dedicated cluster allocations continuously spikes operational costs. I would configure the jobs to leverage **Serverless DLT / Lakeflow Compute** with automated vertical **Auto-Scaling (Enhanced Autoscaling)**. This dynamically adds workers during heavy morning ETL runs and scales down to zero when idle, lowering cloud overheads.
+
+### D. Governance & Enterprise Access Control
+*   *Current Quest Approach:* Configured a standard manual SQL user group assignment block inside the workspace console namespace.
+*   *Enterprise Approach:* To manage security at scale, I would automate the infrastructure using **Terraform** connected to an enterprise Identity Provider via SCIM (e.g., Okta or Entra ID). I would also implement **Row-Level Security (RLS)** filters and **Column-Level Data Masking** tags inside the Unity Catalog layer, ensuring internal analytics users only see data rows relevant to their assigned regions or compliance clearings.
+
+### E. Monitoring & Production Alerting
+*   *Current Quest Approach:* Logs output notifications directly onto the execution screen panel.
+*   *Enterprise Approach:* Production environments require instant notification metrics. I would wire the DLT event log outputs directly into enterprise telemetry platforms (such as Prometheus, Grafana, or Databricks SQL Alerts). If data quality expectations drop beneath a set threshold (e.g., if more than 2% of rows fail validation keys), the system would immediately trigger automated pages to the on-call engineering team via PagerDuty or Slack webhooks.
 
 ---
 
-## 🧠 4. Retrospective & System Adaptations
+## 🧠 3. Engineering Retrospective (Hardest Challenges Overcome)
 
-*   **The Invalid Character Blockage:** Encountering nested column spaces like `data.element.Nation ID` inside the population JSON payload initially blocked Delta table registration. This was overcome by shifting to native **Delta Column Mapping** variables, decoupling physical text constraints from logical execution queries.
-*   **Infrastructure Locks (`TABLE_ALREADY_MANAGED`):** When redeploying code modifications, Unity Catalog properly threw concurrency exceptions indicating that older pipeline run tracking IDs still held physical ownership parameters over the tables. This highlighted the strength of UC's data governance boundaries and was managed by clearing metadata locks or establishing distinct execution environmental namespaces (`dev` vs `prod`).
-
----
-
-## 🔒 5. Governance, Security, & Stakeholder Delivery
-
-### Databricks Asset Bundles (DABs) Deployment
-The manual, error-prone process of UI clicking was entirely replaced with **Infrastructure as Code (IaC)** using a declarative `databricks.yml` file. This pairs an orchestration Job with the Delta Live Tables engine, chaining Task 1 (`step1_ingestion_task`) as a strict parent dependency to Task 2 (`step2_dlt_pipeline_task`). It also leverages single-node architecture settings (`num_workers: 0`, `spark.master: local[*]`) to keep cloud costs minimal.
+1.  **The Hidden Whitespace Header Trap:** The most time-consuming challenge was debugging the invisible whitespace padding characters embedded inside the raw BLS column headers (e.g., `'series_id        '`). Because the file format uses variable tab spacing, Spark's standard CSV parser read the column names literally. Standard downstream filter evaluations failed silently with `Column not found` exceptions. This was resolved by designing an automated header-cleaning loop at the Bronze boundary that dynamically runs `.strip()` across all columns, making the pipeline completely resilient.
+2.  **Special Characters in JSON Keys:** The nested DataUSA population JSON response returned structural property strings containing invalid space characters (such as `Nation ID` and `ID Year`). Delta Tables natively block these characters, which crashed the initial database registration step. To fix this without writing rigid, hardcoded schema parsing logic, I enabled native **Delta Column Mapping** (`delta.columnMapping.mode = name`) directly inside the DLT configurations. This cleanly uncouples the logical query language names from the underlying storage layer, allowing the pipeline to safely handle arbitrary schemas without errors.
 
 ### Data Governance (Unity Catalog ACLs)
 Enforced strict access rules by provisioning a custom user group (`read_only_analysts`). Using standard ANSI SQL statements, this group was granted `SELECT` privileges exclusively on the Gold reporting layers. Because no privileges are issued for the Bronze tables, Silver tables, or landing Volumes, analysts are implicitly blocked from accessing raw files, preventing unauthorized data discovery.
